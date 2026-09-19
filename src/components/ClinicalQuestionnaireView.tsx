@@ -156,6 +156,19 @@ export function processClinicalQuestionnaire(
   const hxLines: string[] = [];
   let omittedWarningCount = 0;
 
+  // 0. Initialize Pain Scale directly from patient property if present (e.g. 3, "3/5", "NRS 3점")
+  if (patient.painScale !== undefined && patient.painScale !== null && String(patient.painScale).trim() !== '') {
+    const rawPain = String(patient.painScale).trim();
+    if (/^\d+$/.test(rawPain)) {
+      const num = parseInt(rawPain, 10);
+      cc.painScale = num <= 5 ? `통증 척도 ${num}/5점` : `통증 척도 ${num}/10점`;
+    } else if (/^\d+\s*\/\s*\d+/.test(rawPain)) {
+      cc.painScale = rawPain.includes('통증') ? rawPain : `통증 척도 ${rawPain.endsWith('점') ? rawPain : rawPain + '점'}`;
+    } else {
+      cc.painScale = rawPain.startsWith('통증') || rawPain.startsWith('NRS') ? rawPain : `통증 척도 ${rawPain}`;
+    }
+  }
+
   // Split inputs line by line
   const ccRawLines = (patient.chiefComplaint || '')
     .split(/\r?\n/)
@@ -208,6 +221,11 @@ export function processClinicalQuestionnaire(
       let text = chunk.trim().replace(/,{2,}/g, ', ');
       if (!text || isExcludedNotice(text)) continue;
 
+      // Skip redundant detail tags (e.g., [세부: 음식을 씹을 때...]) which repeat checkbox symptoms
+      if (/^\[?\s*세부\s*[:\]]/i.test(text)) {
+        continue;
+      }
+
       // 1-A. [NHS MCM 위험 등급]
       if (/\[?\s*(?:NHS\s*MCM|MCM)\s*(?:위험\s*등급)?\s*\]?|NHS\s*MCM/i.test(text)) {
         const isHighRisk = /고위험|HIGH\s*RISK|🔴/i.test(text);
@@ -223,13 +241,13 @@ export function processClinicalQuestionnaire(
         continue;
       }
 
-      // 1-B. Embedded Pain Scale & Onset in parentheses (e.g., "(통증 4/5, 1달 이상 만성 불편)")
-      const parenMatch = text.match(/\(([^)]+)\)/);
-      if (parenMatch) {
-        const parenContent = parenMatch[1];
+      // 1-B. Embedded Pain Scale & Onset in ALL parentheses (e.g. "(입안 전체)" & "(통증 3/5, 1~2주 전부터 지속됨)")
+      const parenMatches = [...text.matchAll(/\(([^)]+)\)/g)];
+      for (const m of parenMatches) {
+        const parenContent = m[1];
 
-        // Check for embedded pain scale (e.g., "통증 4/5" or "통증 8/10")
-        const painMatch = parenContent.match(/통증\s*(\d+\s*\/\s*\d+[^,]*)/i);
+        // Check for embedded pain scale (e.g., "통증 3/5", "통증 4/5", "통증 8/10", "통증 2점", "NRS 1점", "통증 0")
+        const painMatch = parenContent.match(/(?:NRS|통증)\s*(\d+(?:\s*\/\s*\d+)?(?:\s*점)?(?:[^\s,)]*))/i);
         if (painMatch && !cc.painScale) {
           const score = painMatch[1].trim();
           cc.painScale = score.includes('점') ? `통증 척도 ${score}` : `통증 척도 ${score}점`;
@@ -237,18 +255,20 @@ export function processClinicalQuestionnaire(
 
         // Only synthesize onset into Hx if historyOfPresentIllness does NOT already contain an onset statement
         if (!hxAlreadyHasTimeline) {
-          const onsetMatch = parenContent.match(/(\d+\s*(?:일|주|달|개월|년)\s*(?:이상|전부터)?\s*(?:만성\s*불편|급성\s*악화|시작)?)/i);
+          const onsetMatch = parenContent.match(/(\d+\s*(?:일|주|달|개월|년)\s*(?:이상|전부터|전)?\s*(?:만성\s*불편|급성\s*악화|시작|지속(?:됨)?)?)/i);
           if (onsetMatch) {
             const matchedOnset = onsetMatch[0].trim();
-            const timelineText = matchedOnset.includes('불편') || matchedOnset.includes('악화') || matchedOnset.includes('시작')
+            const timelineText = matchedOnset.includes('불편') || matchedOnset.includes('악화') || matchedOnset.includes('시작') || matchedOnset.includes('지속')
               ? `[발병시기 및 경과] ${matchedOnset}`
               : `[발병시기 및 경과] ${matchedOnset} 경과`;
             addOrUpdateHxLine(hxLines, timelineText);
           }
         }
 
-        // Clean out parentheses from the main symptom line
-        text = text.replace(/\([^)]+\)/g, '').trim();
+        // If this parenthesis contained metadata (pain or timeline/duration), remove ONLY this parenthesis from text!
+        if (painMatch || /(?:\d+\s*(?:일|주|달|개월|년)|만성|급성|발병|시작|지속)/.test(parenContent)) {
+          text = text.replace(m[0], '').trim();
+        }
       }
 
       // 1-C. Standalone Pain Scale (NRS)
@@ -309,6 +329,23 @@ export function processClinicalQuestionnaire(
     for (const chunk of subChunks.length > 0 ? subChunks : [line]) {
       let text = chunk.trim().replace(/,{2,}/g, ', ');
       if (!text || isExcludedNotice(text)) continue;
+
+      // Extract pain scale if present in Hx chunk (e.g., "NRS 통증 척도 3/5점." or "통증 척도 4점")
+      if (/(?:NRS\s*)?통증\s*척도|\bNRS\s*\d+/i.test(text)) {
+        if (!cc.painScale) {
+          const painExtract = text.match(/(?:NRS\s*)?통증\s*척도\s*(\d+(?:\s*\/\s*\d+)?점?)|NRS\s*(\d+(?:\s*\/\s*\d+)?점?)/i);
+          if (painExtract) {
+            const score = (painExtract[1] || painExtract[2]).trim();
+            cc.painScale = `통증 척도 ${score.includes('점') ? score : score + '점'}`;
+          }
+        }
+        // If the chunk is purely a pain scale statement, do not add it as Hx line
+        if (/^(?:NRS\s*)?통증\s*척도\s*\d+.*[.?!]?$/i.test(text.trim()) || /^NRS\s*\d+.*[.?!]?$/i.test(text.trim())) {
+          continue;
+        }
+        text = text.replace(/(?:NRS\s*)?통증\s*척도\s*\d+(?:\s*\/\s*\d+)?점?[.]?/gi, '').trim();
+        if (!text) continue;
+      }
 
       // 2-A. Specialized Clinical Sections
       // [연조직 및 점막 소견]

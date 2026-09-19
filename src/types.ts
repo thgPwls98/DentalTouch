@@ -56,6 +56,7 @@ export interface QueuePatient {
   assignedChair: string; // 체어 번호 (예: 2번 체어)
   triageLevel: TriageLevel;
   status: PatientStatus;
+  painScale?: string | number; // 통증 척도 (예: 3, 3/5, NRS 3점 등)
   doctorDiagnosisNote: string;
   treatmentPlan: string;
   prescriptions: string;
