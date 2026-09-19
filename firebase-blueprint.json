@@ -1,0 +1,83 @@
+{
+  "entities": {
+    "QueuePatient": {
+      "title": "QueuePatient",
+      "description": "Dental triage queue patient document for real-time EMR and queue control",
+      "type": "object",
+      "properties": {
+        "patient": {
+          "type": "object",
+          "description": "Patient basic information including name, age, gender, phone, patientId, rrnFront"
+        },
+        "date": {
+          "type": "string",
+          "description": "Visit date (YYYY-MM-DD)"
+        },
+        "time": {
+          "type": "string",
+          "description": "Visit time (HH:mm)"
+        },
+        "areaTitle": {
+          "type": "string",
+          "description": "Pain or treatment oral area (e.g., 상악 우측 대구치)"
+        },
+        "locationTitle": {
+          "type": "string",
+          "description": "Clinic location title (e.g., 2층 보존과 진료실)"
+        },
+        "chiefComplaint": {
+          "type": "string",
+          "description": "Chief Complaint (C.C)"
+        },
+        "historyOfPresentIllness": {
+          "type": "string",
+          "description": "History of Present Illness (Hx)"
+        },
+        "suspectedConditions": {
+          "type": "array",
+          "description": "Differential suspected diagnosis conditions"
+        },
+        "recommendedDepartment": {
+          "type": "string",
+          "description": "Recommended dental department (보존과, 치주과, 보철과, 구강외과, 구강내과)"
+        },
+        "recommendedRoom": {
+          "type": "string",
+          "description": "Recommended clinic room (e.g., 제1진료실)"
+        },
+        "assignedChair": {
+          "type": "string",
+          "description": "Assigned dental chair number (e.g., 3번 체어)"
+        },
+        "triageLevel": {
+          "type": "string",
+          "description": "Triage severity level (응급, 준응급, 일반)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Patient progress status (호출중, 진료대기, 진료중, 완료)",
+          "enum": ["호출중", "진료대기", "진료중", "완료"]
+        },
+        "doctorDiagnosisNote": {
+          "type": "string",
+          "description": "Doctor's clinical diagnosis notes"
+        },
+        "treatmentPlan": {
+          "type": "string",
+          "description": "Doctor's planned dental treatment procedures"
+        },
+        "prescriptions": {
+          "type": "string",
+          "description": "Prescription details and medications"
+        }
+      },
+      "required": ["patient", "date", "time", "status"]
+    }
+  },
+  "firestore": {
+    "/dental_triage_queue/{id}": {
+      "schema": "QueuePatient",
+      "description": "Dental triage queue documents for patient tracking and EMR records"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "projectId": "dentaltouch",
+  "appId": "1:746377691718:web:1c8b2e9ecc7e58b19c8047",
+  "apiKey": "AIzaSyBDNJX7LSuFwQedhDIELacjowLKbQM37_w",
+  "authDomain": "dentaltouch.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "dentaltouch.firebasestorage.app",
+  "messagingSenderId": "746377691718"
+}
