@@ -39,6 +39,113 @@ export interface ProcessedClinicalQuestionnaire {
  * 2. History of Present Illness (Hx): Pure onset timeline & clinical course (omitting warnings, patient info, and C.C)
  * 3. Medications & Medical History: Preserved in the dedicated safety card
  */
+/**
+ * Helper to normalize text for strict and fuzzy symptom deduplication
+ */
+function normalizeSymptomText(s: string): string {
+  return s
+    .replace(/["'\[\]()]/g, '')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+/**
+ * Checks if a candidate symptom is semantically duplicate of an existing symptom
+ */
+function isDuplicateSymptom(existingList: string[], candidate: string): boolean {
+  if (!candidate || candidate.trim().length < 2) return true;
+  const normCandidate = normalizeSymptomText(candidate);
+
+  // Extract inner quoted text if present (e.g., 부위에 "..." 호소)
+  const quoteMatch = candidate.match(/["']([^"']{4,})["']/);
+  const normQuoted = quoteMatch ? normalizeSymptomText(quoteMatch[1]) : '';
+
+  return existingList.some((existing) => {
+    const normExisting = normalizeSymptomText(existing);
+    if (normExisting === normCandidate) return true;
+    if (normExisting.includes(normCandidate) || normCandidate.includes(normExisting)) return true;
+    if (normQuoted && (normExisting.includes(normQuoted) || normQuoted.includes(normExisting))) return true;
+
+    // Check significant token overlap (words >= 2 characters)
+    const wordsCandidate = candidate.split(/[\s,.'"]+/).filter((w) => w.length >= 2);
+    const wordsExisting = existing.split(/[\s,.'"]+/).filter((w) => w.length >= 2);
+    if (wordsCandidate.length >= 3 && wordsExisting.length >= 3) {
+      const matchCount = wordsCandidate.filter((w) => normExisting.includes(normalizeSymptomText(w))).length;
+      if (matchCount / wordsCandidate.length >= 0.5) return true;
+    }
+    return false;
+  });
+}
+
+/**
+ * Strips bracket tags from history lines for pure content comparison
+ */
+function stripHxTag(s: string): string {
+  return s.replace(/^\[[^\]]+\]\s*/, '').replace(/^[•*·-]\s*/, '').trim();
+}
+
+/**
+ * Adds or upgrades an Hx line, preventing duplicates (such as repeated onset/timeline statements)
+ */
+function addOrUpdateHxLine(hxLines: string[], newLine: string): void {
+  if (!newLine || newLine.trim().length < 2) return;
+  const cleanNew = newLine.trim();
+  const textNew = stripHxTag(cleanNew);
+  const normNew = normalizeSymptomText(textNew);
+
+  // Timeline keyword extraction (e.g., "1달 이상", "3일 전", "2주 전", etc.)
+  const tNewMatch = textNew.match(/(\d+\s*(?:일|주|달|개월|년)\s*(?:이상|전부터|전)?)/i);
+  const tNew = tNewMatch ? tNewMatch[0].replace(/\s+/g, '') : null;
+
+  const existingIdx = hxLines.findIndex((existing) => {
+    const textExisting = stripHxTag(existing);
+    const normExisting = normalizeSymptomText(textExisting);
+    if (normExisting === normNew) return true;
+    if (normExisting.includes(normNew) || normNew.includes(normExisting)) return true;
+
+    // Timeline period match: if both describe the same duration (e.g. 1달이상)
+    if (tNew) {
+      const tExistingMatch = textExisting.match(/(\d+\s*(?:일|주|달|개월|년)\s*(?:이상|전부터|전)?)/i);
+      if (tExistingMatch) {
+        const tExisting = tExistingMatch[0].replace(/\s+/g, '');
+        if (tNew === tExisting || tNew.includes(tExisting) || tExisting.includes(tNew)) {
+          return true;
+        }
+      }
+    }
+
+    // Token overlap of clinical words
+    const wordsNew = textNew.split(/[\s,.'"]+/).filter((w) => w.length >= 2);
+    const wordsExisting = textExisting.split(/[\s,.'"]+/).filter((w) => w.length >= 2);
+    if (wordsNew.length >= 2 && wordsExisting.length >= 2) {
+      const matchCount = wordsNew.filter((w) => normExisting.includes(normalizeSymptomText(w))).length;
+      if (matchCount / wordsNew.length >= 0.5) return true;
+    }
+
+    return false;
+  });
+
+  if (existingIdx >= 0) {
+    // If the new line has more descriptive detail, upgrade the existing line
+    const existing = hxLines[existingIdx];
+    const textExisting = stripHxTag(existing);
+    if (textNew.length > textExisting.length || !existing.startsWith('[')) {
+      const existingTagMatch = existing.match(/^\[([^\]]+)\]/);
+      const newTagMatch = cleanNew.match(/^\[([^\]]+)\]/);
+      const tag = newTagMatch ? newTagMatch[1] : (existingTagMatch ? existingTagMatch[1] : '발병시기 및 경과');
+      hxLines[existingIdx] = `[${tag}] ${textNew}`;
+    }
+  } else {
+    hxLines.push(cleanNew);
+  }
+}
+
+/**
+ * Parses and separates raw patient questionnaire inputs into clean clinical sections:
+ * 1. Chief Complaint (C.C): Main symptoms, pain scale (NRS), and chewing/functional impairments (with clean line breaks)
+ * 2. History of Present Illness (Hx): Pure onset timeline & clinical course (omitting warnings, patient info, and C.C)
+ * 3. Medications & Medical History: Preserved in the dedicated safety card
+ */
 export function processClinicalQuestionnaire(
   patient: Partial<QueuePatient>
 ): ProcessedClinicalQuestionnaire {
@@ -49,115 +156,24 @@ export function processClinicalQuestionnaire(
   const hxLines: string[] = [];
   let omittedWarningCount = 0;
 
-  // Collect candidate text lines from both chiefComplaint and historyOfPresentIllness
-  const rawSources = [
-    patient.chiefComplaint || '',
-    patient.historyOfPresentIllness || '',
-  ].filter(Boolean);
+  // Split inputs line by line
+  const ccRawLines = (patient.chiefComplaint || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
 
-  const rawChunks: string[] = [];
-  for (const src of rawSources) {
-    // Split by newlines first
-    const lines = src.split(/\r?\n/);
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+  const hxRawLines = (patient.historyOfPresentIllness || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
 
-      // Further split if multiple bracketed sections or distinct sentence markers are chained
-      const subChunks = trimmed
-        .split(/(?=\[[^\]]+\])|(?<=[.?!])\s+(?=[가-힣A-Za-z0-9"\[])/g)
-        .map((c) => c.trim())
-        .filter(Boolean);
+  // Check if historyOfPresentIllness already has an explicit onset/timeline
+  const hxAlreadyHasTimeline = hxRawLines.some((l) =>
+    /(?:\d+\s*(?:일|주|달|개월|년)|어제|오늘|새벽|최근|만성\s*불편|급성\s*발병|시작)/i.test(l)
+  );
 
-      if (subChunks.length > 0) {
-        rawChunks.push(...subChunks);
-      } else {
-        rawChunks.push(trimmed);
-      }
-    }
-  }
-
-  for (const chunk of rawChunks) {
-    let text = chunk.trim();
-    if (!text) continue;
-
-    // Normalize comma stuttering (e.g., "아픔,, 잇몸이" -> "아픔, 잇몸이")
-    text = text.replace(/,{2,}/g, ', ');
-
-    // 0-A. [NHS MCM 위험 등급]: 🔴 고위험군 (HIGH RISK)만 C.C 참고 항목으로 유지, 그 외 참고 등급은 C.C에서 제외
-    if (/\[?\s*(?:NHS\s*MCM|MCM)\s*(?:위험\s*등급)?\s*\]?|NHS\s*MCM/i.test(text)) {
-      const isHighRisk = /고위험|HIGH\s*RISK|🔴/i.test(text);
-      if (isHighRisk) {
-        let cleanMcm = text.replace(/^[•*·-]\s*/, '').trim();
-        if (!cleanMcm.startsWith('[')) {
-          cleanMcm = `[NHS MCM 위험 등급] ${cleanMcm.replace(/^NHS\s*MCM(?:\s*위험\s*등급)?[:\s-]*/i, '')}`;
-        }
-        if (!cc.additionalNotes.includes(cleanMcm)) {
-          cc.additionalNotes.push(cleanMcm);
-        }
-      }
-      // 고위험군이 아닌 위험 등급은 C.C(주소)에서 제외
-      continue;
-    }
-
-    // 0-B. 현병력 (Hx) 전용 분류 항목: [연조직 및 점막 소견], [삼킴 및 타액 상태], [치과 보철 이력], [전신질환 및 종양학]
-    // 1) [연조직 및 점막 소견]
-    if (/\[\s*(?:연조직(?:\s*및\s*점막)?(?:\s*소견)?|점막\s*소견)\s*\]|연조직\s*및\s*점막\s*소견/i.test(text)) {
-      let cleanBody = text
-        .replace(/^\[\s*(?:연조직(?:\s*및\s*점막)?(?:\s*소견)?|점막\s*소견)\s*\][:\s-]*/i, '')
-        .replace(/^연조직\s*및\s*점막\s*소견[:\s-]*/i, '')
-        .replace(/^[•*·-]\s*/, '')
-        .trim();
-      const lineToAdd = cleanBody ? `[연조직 및 점막 소견] ${cleanBody}` : '[연조직 및 점막 소견] 특이 소견 관찰';
-      if (!hxLines.some((l) => l.includes(cleanBody || '연조직 및 점막 소견'))) {
-        hxLines.push(lineToAdd);
-      }
-      continue;
-    }
-
-    // 2) [삼킴 및 타액 상태]
-    if (/\[\s*(?:삼킴(?:\s*및\s*타액)?(?:\s*상태)?|타액\s*상태)\s*\]|삼킴\s*및\s*타액\s*상태/i.test(text)) {
-      let cleanBody = text
-        .replace(/^\[\s*(?:삼킴(?:\s*및\s*타액)?(?:\s*상태)?|타액\s*상태)\s*\][:\s-]*/i, '')
-        .replace(/^삼킴\s*및\s*타액\s*상태[:\s-]*/i, '')
-        .replace(/^[•*·-]\s*/, '')
-        .trim();
-      const lineToAdd = cleanBody ? `[삼킴 및 타액 상태] ${cleanBody}` : '[삼킴 및 타액 상태] 특이 소견 관찰';
-      if (!hxLines.some((l) => l.includes(cleanBody || '삼킴 및 타액 상태'))) {
-        hxLines.push(lineToAdd);
-      }
-      continue;
-    }
-
-    // 3) [치과 보철 이력]
-    if (/\[\s*(?:치과\s*)?보철\s*이력\s*\]|(?:치과\s*)?보철\s*이력/i.test(text)) {
-      let cleanBody = text
-        .replace(/^\[\s*(?:치과\s*)?보철\s*이력\s*\][:\s-]*/i, '')
-        .replace(/^(?:치과\s*)?보철\s*이력[:\s-]*/i, '')
-        .replace(/^[•*·-]\s*/, '')
-        .trim();
-      const lineToAdd = cleanBody ? `[치과 보철 이력] ${cleanBody}` : '[치과 보철 이력] 기왕력 있음';
-      if (!hxLines.some((l) => l.includes(cleanBody || '보철 이력'))) {
-        hxLines.push(lineToAdd);
-      }
-      continue;
-    }
-
-    // 4) [전신질환 및 종양학]
-    if (/\[\s*(?:전신질환(?:\s*및\s*종양학)?|종양학)\s*\]|전신질환\s*및\s*종양학/i.test(text)) {
-      let cleanBody = text
-        .replace(/^\[\s*(?:전신질환(?:\s*및\s*종양학)?|종양학)\s*\][:\s-]*/i, '')
-        .replace(/^전신질환\s*및\s*종양학[:\s-]*/i, '')
-        .replace(/^[•*·-]\s*/, '')
-        .trim();
-      const lineToAdd = cleanBody ? `[전신질환 및 종양학] ${cleanBody}` : '[전신질환 및 종양학] 기왕력 있음';
-      if (!hxLines.some((l) => l.includes(cleanBody || '전신질환 및 종양학'))) {
-        hxLines.push(lineToAdd);
-      }
-      continue;
-    }
-
-    // 1. Exclude Warnings & Medication safety headers (already in the dedicated safety box below)
+  // Helper to check and filter out safety warnings / patient info headers
+  const isExcludedNotice = (text: string) => {
     if (
       /\[(?:임상\s*필독\s*경고문|진료의\s*필독|주의사항)\]/i.test(text) ||
       /(?:임상\s*필독\s*경고문|진료의\s*필독)/i.test(text) ||
@@ -166,119 +182,248 @@ export function processClinicalQuestionnaire(
       /(?:약물\s*알러지|알레르기|지혈\s*지연|출혈\s*성향)/i.test(text)
     ) {
       omittedWarningCount++;
-      continue;
+      return true;
     }
-
-    // 2. Exclude Patient demographics (already on the top patient header)
     if (
       /\[환자\s*정보\]/i.test(text) ||
       /(?:성명|등록번호|차트번호)\s*:/i.test(text) ||
       /^\d+세\s*(?:남성|여성|남|여)/i.test(text)
     ) {
-      continue;
+      return true;
     }
+    return false;
+  };
 
-    // 3. Pain Scale (NRS) -> route to Chief Complaint
-    if (/NRS|통증\s*척도|\b\d+\s*\/\s*5점|\b\d+\s*\/\s*10점/i.test(text)) {
-      let cleanPain = text.replace(/^[•*·-]\s*/, '').trim();
-      if (!cleanPain.endsWith('.')) cleanPain += '.';
-      if (!cc.painScale) {
-        cc.painScale = cleanPain;
+  // --------------------------------------------------------------------------
+  // STEP 1: Process Chief Complaint (C.C) Lines
+  // --------------------------------------------------------------------------
+  for (const line of ccRawLines) {
+    // Split on bracketed segments or sentence terminators if combined
+    const subChunks = line
+      .split(/(?=\[[^\]]+\])|(?<=[.?!])\s+(?=[가-힣A-Za-z0-9"\[])/g)
+      .map((c) => c.trim())
+      .filter(Boolean);
+
+    for (const chunk of subChunks.length > 0 ? subChunks : [line]) {
+      let text = chunk.trim().replace(/,{2,}/g, ', ');
+      if (!text || isExcludedNotice(text)) continue;
+
+      // 1-A. [NHS MCM 위험 등급]
+      if (/\[?\s*(?:NHS\s*MCM|MCM)\s*(?:위험\s*등급)?\s*\]?|NHS\s*MCM/i.test(text)) {
+        const isHighRisk = /고위험|HIGH\s*RISK|🔴/i.test(text);
+        if (isHighRisk) {
+          let cleanMcm = text.replace(/^[•*·-]\s*/, '').trim();
+          if (!cleanMcm.startsWith('[')) {
+            cleanMcm = `[NHS MCM 위험 등급] ${cleanMcm.replace(/^NHS\s*MCM(?:\s*위험\s*등급)?[:\s-]*/i, '')}`;
+          }
+          if (!cc.additionalNotes.includes(cleanMcm)) {
+            cc.additionalNotes.push(cleanMcm);
+          }
+        }
+        continue;
       }
-      continue;
-    }
 
-    // 4. Chewing & Functional Impairment (저작/일상 장애) -> route to Chief Complaint
-    if (
-      /\[일상\s*및\s*저작\s*장애\]|저작\s*장애|씹지\s*못함|씹을\s*수\s*없|아픈\s*쪽으로는\s*전혀/i.test(
-        text
-      )
-    ) {
-      let cleanImp = text
-        .replace(/\[일상\s*및\s*저작\s*장애\]/g, '')
-        .replace(/심층\s*증상\s*:.*$/i, '')
-        .replace(/^[•*·-]\s*/, '')
-        .trim();
-      // Clean up punctuation
-      cleanImp = cleanImp.replace(/^[,:\s-]+/, '').replace(/[,:\s-]+$/, '');
-      if (cleanImp && !cc.functionalImpairment) {
-        cc.functionalImpairment = cleanImp;
+      // 1-B. Embedded Pain Scale & Onset in parentheses (e.g., "(통증 4/5, 1달 이상 만성 불편)")
+      const parenMatch = text.match(/\(([^)]+)\)/);
+      if (parenMatch) {
+        const parenContent = parenMatch[1];
+
+        // Check for embedded pain scale (e.g., "통증 4/5" or "통증 8/10")
+        const painMatch = parenContent.match(/통증\s*(\d+\s*\/\s*\d+[^,]*)/i);
+        if (painMatch && !cc.painScale) {
+          const score = painMatch[1].trim();
+          cc.painScale = score.includes('점') ? `통증 척도 ${score}` : `통증 척도 ${score}점`;
+        }
+
+        // Only synthesize onset into Hx if historyOfPresentIllness does NOT already contain an onset statement
+        if (!hxAlreadyHasTimeline) {
+          const onsetMatch = parenContent.match(/(\d+\s*(?:일|주|달|개월|년)\s*(?:이상|전부터)?\s*(?:만성\s*불편|급성\s*악화|시작)?)/i);
+          if (onsetMatch) {
+            const matchedOnset = onsetMatch[0].trim();
+            const timelineText = matchedOnset.includes('불편') || matchedOnset.includes('악화') || matchedOnset.includes('시작')
+              ? `[발병시기 및 경과] ${matchedOnset}`
+              : `[발병시기 및 경과] ${matchedOnset} 경과`;
+            addOrUpdateHxLine(hxLines, timelineText);
+          }
+        }
+
+        // Clean out parentheses from the main symptom line
+        text = text.replace(/\([^)]+\)/g, '').trim();
       }
-      continue;
-    }
 
-    // 5. Subjective Chief Complaints (주호소, 부위별 호소 증상, 통증 호소 등) -> route to Chief Complaint
-    if (
-      /\[(?:주호소|주소)\]/i.test(text) ||
-      /호소\s*[.]?$/i.test(text) ||
-      /부위[에]?\s*["'].+["']\s*호소/i.test(text) ||
-      /(?:위쪽|아래쪽|상악|하악|전치부|구치부|치아|잇몸).*(?:아픔|통증|시림|흔들|부었|깨짐|빠짐)/i.test(
-        text
-      ) ||
-      /(?:아파요|시려요|욱신거려요|부었어요|떨어졌어요|흔들려요)/i.test(text)
-    ) {
+      // 1-C. Standalone Pain Scale (NRS)
+      if (/NRS|통증\s*척도|\b\d+\s*\/\s*5점|\b\d+\s*\/\s*10점/i.test(text)) {
+        let cleanPain = text.replace(/^[•*·-]\s*/, '').trim();
+        if (!cleanPain.endsWith('.')) cleanPain += '.';
+        if (!cc.painScale) {
+          cc.painScale = cleanPain;
+        }
+        continue;
+      }
+
+      // 1-D. Chewing & Functional Impairment (저작/일상 장애)
+      if (
+        /\[일상\s*및\s*저작\s*장애\]|저작\s*장애|씹지\s*못함|씹을\s*수\s*없|아픈\s*쪽으로는\s*전혀/i.test(
+          text
+        )
+      ) {
+        let cleanImp = text
+          .replace(/\[일상\s*및\s*저작\s*장애\]/g, '')
+          .replace(/심층\s*증상\s*:.*$/i, '')
+          .replace(/^[•*·-]\s*/, '')
+          .trim()
+          .replace(/^[,:\s-]+/, '')
+          .replace(/[,:\s-]+$/, '');
+        if (cleanImp && !cc.functionalImpairment) {
+          cc.functionalImpairment = cleanImp;
+        }
+        continue;
+      }
+
+      // 1-E. Main Spoken Symptoms
       let cleanSym = text
         .replace(/\[(?:주호소|주소)\]/g, '')
         .replace(/심층\s*증상\s*:.*$/i, '')
         .replace(/^[•*·-]\s*/, '')
+        .trim()
+        .replace(/^["']+|["']+$/g, '')
         .trim();
-      // Strip redundant quotes around entire statement if malformed
-      cleanSym = cleanSym.replace(/^["']+|["']+$/g, '').trim();
+
       if (cleanSym.length >= 2) {
-        const isDuplicate = cc.mainSymptoms.some(
-          (existing) =>
-            existing.includes(cleanSym.substring(0, Math.min(10, cleanSym.length))) ||
-            cleanSym.includes(existing.substring(0, Math.min(10, existing.length)))
-        );
-        if (!isDuplicate) {
+        if (!isDuplicateSymptom(cc.mainSymptoms, cleanSym)) {
           cc.mainSymptoms.push(cleanSym);
         }
-      }
-      continue;
-    }
-
-    // 6. Clinical History of Present Illness (발병 시기, 진행 경과, 유발 자극 등) -> route to Hx
-    if (
-      /\[(?:발병시기|발병\s*시기\s*및\s*주호소)\]/i.test(text) ||
-      /(?:\d+\s*일|\d+\s*주|\d+\s*개월|\d+\s*년|어제|오늘|새벽|최근)\s*전부터/i.test(text) ||
-      /급성\s*발병|점진적\s*악화|시작됨|지속|냉자극|온자극|자발통/i.test(text)
-    ) {
-      let cleanHx = text
-        .replace(/\[(?:발병시기|발병\s*시기\s*및\s*주호소)\]/g, '')
-        .replace(/시작됨\s*시작[.]?/g, '시작됨.')
-        .replace(/^[•*·-]\s*/, '')
-        .trim();
-
-      // Clean up punctuation
-      cleanHx = cleanHx.replace(/^[,:\s-]+/, '').replace(/[,:\s-]+$/, '');
-      if (cleanHx.length >= 2) {
-        if (!cleanHx.endsWith('.')) cleanHx += '.';
-        const isDuplicate = hxLines.some(
-          (existing) =>
-            existing.includes(cleanHx.substring(0, Math.min(10, cleanHx.length))) ||
-            cleanHx.includes(existing.substring(0, Math.min(10, existing.length)))
-        );
-        if (!isDuplicate) {
-          hxLines.push(cleanHx);
-        }
-      }
-      continue;
-    }
-
-    // Fallback: If it has clinical onset/progression keywords, route to Hx; all other unclassified "참고" notes are removed from C.C per instruction
-    if (text.length >= 3 && /시작|경과|발병|진행/.test(text)) {
-      let cleanFallback = text.replace(/^[•*·-]\s*/, '').trim();
-      if (!cleanFallback.endsWith('.')) cleanFallback += '.';
-      if (!hxLines.some((l) => l.includes(cleanFallback))) {
-        hxLines.push(cleanFallback);
       }
     }
   }
 
-  // If no main symptoms detected, fall back to cleaned chief complaint or safe string
+  // --------------------------------------------------------------------------
+  // STEP 2: Process History of Present Illness (Hx) Lines
+  // --------------------------------------------------------------------------
+  for (const line of hxRawLines) {
+    const subChunks = line
+      .split(/(?=\[[^\]]+\])|(?<=[.?!])\s+(?=[가-힣A-Za-z0-9"\[])/g)
+      .map((c) => c.trim())
+      .filter(Boolean);
+
+    for (const chunk of subChunks.length > 0 ? subChunks : [line]) {
+      let text = chunk.trim().replace(/,{2,}/g, ', ');
+      if (!text || isExcludedNotice(text)) continue;
+
+      // 2-A. Specialized Clinical Sections
+      // [연조직 및 점막 소견]
+      if (/\[\s*(?:연조직(?:\s*및\s*점막)?(?:\s*소견)?|점막\s*소견)\s*\]|연조직\s*및\s*점막\s*소견/i.test(text)) {
+        let cleanBody = text
+          .replace(/^\[\s*(?:연조직(?:\s*및\s*점막)?(?:\s*소견)?|점막\s*소견)\s*\][:\s-]*/i, '')
+          .replace(/^연조직\s*및\s*점막\s*소견[:\s-]*/i, '')
+          .replace(/^[•*·-]\s*/, '')
+          .trim();
+        const lineToAdd = cleanBody ? `[연조직 및 점막 소견] ${cleanBody}` : '[연조직 및 점막 소견] 특이 소견 관찰';
+        addOrUpdateHxLine(hxLines, lineToAdd);
+        continue;
+      }
+
+      // [삼킴 및 타액 상태]
+      if (/\[\s*(?:삼킴(?:\s*및\s*타액)?(?:\s*상태)?|타액\s*상태)\s*\]|삼킴\s*및\s*타액\s*상태/i.test(text)) {
+        let cleanBody = text
+          .replace(/^\[\s*(?:삼킴(?:\s*및\s*타액)?(?:\s*상태)?|타액\s*상태)\s*\][:\s-]*/i, '')
+          .replace(/^삼킴\s*및\s*타액\s*상태[:\s-]*/i, '')
+          .replace(/^[•*·-]\s*/, '')
+          .trim();
+        const lineToAdd = cleanBody ? `[삼킴 및 타액 상태] ${cleanBody}` : '[삼킴 및 타액 상태] 특이 소견 관찰';
+        addOrUpdateHxLine(hxLines, lineToAdd);
+        continue;
+      }
+
+      // [치과 보철 이력]
+      if (/\[\s*(?:치과\s*)?보철\s*이력\s*\]|(?:치과\s*)?보철\s*이력/i.test(text)) {
+        let cleanBody = text
+          .replace(/^\[\s*(?:치과\s*)?보철\s*이력\s*\][:\s-]*/i, '')
+          .replace(/^(?:치과\s*)?보철\s*이력[:\s-]*/i, '')
+          .replace(/^[•*·-]\s*/, '')
+          .trim();
+        const lineToAdd = cleanBody ? `[치과 보철 이력] ${cleanBody}` : '[치과 보철 이력] 기왕력 있음';
+        addOrUpdateHxLine(hxLines, lineToAdd);
+        continue;
+      }
+
+      // [전신질환 및 종양학]
+      if (/\[\s*(?:전신질환(?:\s*및\s*종양학)?|종양학)\s*\]|전신질환\s*및\s*종양학/i.test(text)) {
+        let cleanBody = text
+          .replace(/^\[\s*(?:전신질환(?:\s*및\s*종양학)?|종양학)\s*\][:\s-]*/i, '')
+          .replace(/^전신질환\s*및\s*종양학[:\s-]*/i, '')
+          .replace(/^[•*·-]\s*/, '')
+          .trim();
+        const lineToAdd = cleanBody ? `[전신질환 및 종양학] ${cleanBody}` : '[전신질환 및 종양학] 기왕력 있음';
+        addOrUpdateHxLine(hxLines, lineToAdd);
+        continue;
+      }
+
+      // 2-B. Presentation Phrases in Hx (e.g., ...부위에 "..." 호소. or ...호소하여 내원)
+      if (/호소\s*[.]?$/i.test(text) || /부위[에]?\s*["'].+["']\s*호소/i.test(text) || /\[(?:주호소|주소)\]/i.test(text)) {
+        // If cc.mainSymptoms is already populated, do NOT duplicate it into C.C!
+        if (cc.mainSymptoms.length > 0) {
+          // If this sentence is a restatement of existing C.C, do NOT add as a duplicate [주호소]!
+          if (isDuplicateSymptom(cc.mainSymptoms, text)) {
+            // Check if it adds site details not yet in Hx (e.g. 상악 전치부)
+            const siteMatch = text.match(/(?:상악|하악|전치부|구치부|치은|악관절|[\w#]+부위)/);
+            if (siteMatch && !hxLines.some((l) => l.includes(siteMatch[0]))) {
+              addOrUpdateHxLine(hxLines, `[내원 경위] ${siteMatch[0]} 통증 및 저작 불편감 호소로 내원.`);
+            }
+            continue;
+          }
+        } else {
+          // Fallback: If C.C was empty, extract the quoted or cleaned symptom for C.C
+          let cleanSym = text
+            .replace(/\[(?:주호소|주소)\]/g, '')
+            .replace(/^[•*·-]\s*/, '')
+            .replace(/^["']+|["']+$/g, '')
+            .trim();
+          if (cleanSym.length >= 2) {
+            cc.mainSymptoms.push(cleanSym);
+            continue;
+          }
+        }
+      }
+
+      // 2-C. Clinical History & Onset Timeline
+      if (
+        /\[(?:발병시기|발병\s*시기\s*및\s*주호소|경과)\]/i.test(text) ||
+        /(?:\d+\s*(?:일|주|달|개월|년)\s*(?:이상|전부터|전)?|어제|오늘|새벽|최근)/i.test(text) ||
+        /급성\s*발병|점진적\s*악화|시작|지속|냉자극|온자극|자발통|만성\s*불편/i.test(text)
+      ) {
+        let cleanHx = text
+          .replace(/\[(?:발병시기|발병\s*시기\s*및\s*주호소|경과)\]/g, '')
+          .replace(/시작됨\s*시작[.]?/g, '시작됨.')
+          .replace(/^[•*·-]\s*/, '')
+          .replace(/^[,:\s-]+/, '')
+          .replace(/[,:\s-]+$/, '')
+          .trim();
+
+        if (cleanHx.length >= 2) {
+          if (!cleanHx.endsWith('.')) cleanHx += '.';
+          const taggedLine = cleanHx.startsWith('[') ? cleanHx : `[발병시기 및 경과] ${cleanHx}`;
+          addOrUpdateHxLine(hxLines, taggedLine);
+        }
+        continue;
+      }
+
+      // 2-D. General Clinical Narrative Fallback
+      if (text.length >= 3 && /시작|경과|발병|진행|불편|동통|치료|내원/.test(text)) {
+        let cleanFallback = text.replace(/^[•*·-]\s*/, '').trim();
+        if (!cleanFallback.endsWith('.')) cleanFallback += '.';
+        addOrUpdateHxLine(hxLines, cleanFallback);
+      }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // STEP 3: Fallbacks & Final Guarantees
+  // --------------------------------------------------------------------------
   if (cc.mainSymptoms.length === 0) {
     let cleanedChiefComplaint = (patient.chiefComplaint || '')
       .replace(/\[\s*(?:NHS\s*MCM|MCM|연조직|삼킴|타액|치과\s*보철|보철|전신질환|종양학)[^\]]*\][^\[]*/gi, '')
+      .replace(/\([^)]+\)/g, '')
       .replace(/^[•*·-]\s*/, '')
       .trim();
     if (cleanedChiefComplaint && cleanedChiefComplaint.length >= 2) {
@@ -288,7 +433,7 @@ export function processClinicalQuestionnaire(
     }
   }
 
-  // If no Hx lines left, provide a clean doctor clinical notice
+  // Ensure at least 1 clinical Hx line
   if (hxLines.length === 0) {
     hxLines.push('급성 발병 호소 (원내 치근단 방사선 촬영 및 치수·치주 정밀 검사 요망)');
   }
